@@ -13,7 +13,13 @@ Client& Client::instance() {
     return client;
 }
 
-void Client::initialize(HMODULE module) {
+void Client::initialize(HMODULE module) {// تفعيل الهوك على عنوان وضع الكتل
+uintptr_t baseAddr = (uintptr_t)dlopen("libminecraft.so", RTLD_LAZY);
+if (baseAddr) {
+    void* target = (void*)(baseAddr + 0x0fb99330);
+    // استدعاء الهوك
+}
+
     m_module = module;
 
     // Initialize Logger
@@ -59,4 +65,21 @@ void Client::shutdown() {
     ModuleManager::instance().shutdown();
     Logger::instance().shutdown();
     LOG_INFO("MCBE Client shutdown complete.");
+}// 1. تعريف شكل الإحداثيات
+struct BlockPos {
+    int x;
+    int y;
+    int z;
+};
+
+// 2. تعريف الدالة الأصلية للمباني
+typedef bool (*BlockSource_setBlock_fn)(void* _this, const BlockPos& pos, const void* block, int updateFlags, signed char actorFilter);
+BlockSource_setBlock_fn original_setBlock = nullptr;
+
+// 3. دالة السماح بالبناء فوق سقف النيذر
+bool hooked_BlockSource_setBlock(void* _this, const BlockPos& pos, const void* block, int updateFlags, signed char actorFilter) {
+    if (pos.y >= 128) {
+        return original_setBlock(_this, pos, block, updateFlags, actorFilter);
+    }
+    return original_setBlock(_this, pos, block, updateFlags, actorFilter);
 }
