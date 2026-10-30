@@ -8,20 +8,19 @@
 #include <MinHook.h>
 
 namespace {
-    using ClientUpdateFn = bool(__fastcall*)(ClientInstance* self, bool isInitFinished);
+    using ClientUpdateFn = bool(__fastcall*)(ClientInstance* self, bool isInitFinished, bool allowGameUpdate);
     ClientUpdateFn g_originalClientUpdate = nullptr;
     void* g_clientUpdateTarget = nullptr;
 
-    bool __fastcall hook_client_instance_update(ClientInstance* self, bool isInitFinished) {
+    bool __fastcall hook_client_instance_update(ClientInstance* self, bool isInitFinished, bool allowGameUpdate) {
         if (self) {
             ClientInstance::set(self);
-            minecraft::hooks::update_screen_name(self);
         }
 
-        ClientInstanceUpdateEvent event(self, isInitFinished);
+        ClientInstanceUpdateEvent event(self, isInitFinished, allowGameUpdate);
         EventBus::instance().publish(event);
 
-        return g_originalClientUpdate ? g_originalClientUpdate(self, isInitFinished) : false;
+        return g_originalClientUpdate ? g_originalClientUpdate(self, isInitFinished, allowGameUpdate) : false;
     }
 }
 

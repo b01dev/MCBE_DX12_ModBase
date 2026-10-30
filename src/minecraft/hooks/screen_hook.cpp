@@ -5,12 +5,11 @@
 #include "events/screen_change_event.h"
 #include "utils/logger.h"
 
-#include <MinHook.h>
 #include <mutex>
+#include <new>
 
 namespace {
     using GetScreenNameFn = std::string&(__fastcall*)(ClientInstance* self, std::string& out);
-    GetScreenNameFn g_originalGetScreenName = nullptr;
     void* g_screenTarget = nullptr;
 
     std::string s_currentScreenName;
@@ -23,46 +22,9 @@ namespace {
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
+            new (static_cast<void*>(out)) std::string();
             return false;
         }
-    }
-
-    std::string& __fastcall hook_client_instance_get_screen_name(ClientInstance* self, std::string& out) {
-        if (!g_originalGetScreenName) {
-            return out;
-        }
-
-        std::string& result = g_originalGetScreenName(self, out);
-
-        std::string prevScreen;
-        bool changed = false;
-
-        {
-            std::lock_guard<std::mutex> lock(s_screenMutex);
-            if (result != s_currentScreenName) {
-                prevScreen = s_currentScreenName;
-                s_currentScreenName = result;
-                changed = true;
-            }
-        }
-
-        if (changed) {
-            ScreenChangeEvent event(self, prevScreen, result);
-            EventBus::instance().publish(event);
-
-            if (event.isOverridden()) {
-                std::lock_guard<std::mutex> lock(s_screenMutex);
-                result = event.overrideScreen;
-                s_currentScreenName = event.overrideScreen;
-            }
-        } else {
-            std::lock_guard<std::mutex> lock(s_screenMutex);
-            if (!s_overrideScreenName.empty()) {
-                result = s_overrideScreenName;
-            }
-        }
-
-        return result;
     }
 }
 
@@ -73,21 +35,8 @@ namespace minecraft::hooks {
             return false;
         }
 
-        LOG_INFO("Hooking ClientInstance::getScreenName at address: {:#x}", screenNameAddr);
-
+        LOG_INFO("Configured ClientInstance::getScreenName resolution at address: {:#x}", screenNameAddr);
         g_screenTarget = reinterpret_cast<void*>(screenNameAddr);
-        if (MH_CreateHook(g_screenTarget, reinterpret_cast<LPVOID>(&hook_client_instance_get_screen_name), reinterpret_cast<void**>(&g_originalGetScreenName)) != MH_OK) {
-            LOG_ERROR("Failed to create ClientInstance::getScreenName hook!");
-            g_screenTarget = nullptr;
-            return false;
-        }
-
-        if (MH_EnableHook(g_screenTarget) != MH_OK) {
-            LOG_ERROR("Failed to enable ClientInstance::getScreenName hook!");
-            return false;
-        }
-
-        LOG_INFO("ClientInstance getScreenName hook enabled.");
         return true;
     }
 
@@ -98,19 +47,14 @@ namespace minecraft::hooks {
             s_overrideScreenName.clear();
         }
 
-        if (g_screenTarget) {
-            MH_DisableHook(g_screenTarget);
-            MH_RemoveHook(g_screenTarget);
-            g_screenTarget = nullptr;
-            g_originalGetScreenName = nullptr;
-            LOG_INFO("ClientInstance getScreenName hook removed.");
-        }
+        g_screenTarget = nullptr;
+        LOG_INFO("ClientInstance getScreenName handler removed.");
     }
 
     void update_screen_name(ClientInstance* self) {
         if (!self || !g_screenTarget) return;
 
-        GetScreenNameFn fn = g_originalGetScreenName ? g_originalGetScreenName : reinterpret_cast<GetScreenNameFn>(g_screenTarget);
+        GetScreenNameFn fn = reinterpret_cast<GetScreenNameFn>(g_screenTarget);
         if (!fn) return;
 
         std::string temp;

@@ -82,7 +82,7 @@ set_target_properties(MCBE_DX12_ModBase PROPERTIES
 
 if(MSVC)
     target_compile_options(MCBE_DX12_ModBase PRIVATE 
-        /W4 /permissive- /utf-8 /Zc:preprocessor /FIWindows.h
+        /W4 /permissive- /utf-8 /Zc:preprocessor /FIWindows.h /EHa
         $<$<CONFIG:Release>:/O2 /Ob2 /Oi /Ot /Oy /DNDEBUG>
         $<$<CONFIG:RelWithDebInfo>:/O2 /Ob2 /Oi /Ot /Oy /Zi /DNDEBUG>
     )

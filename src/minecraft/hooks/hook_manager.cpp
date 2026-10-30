@@ -54,11 +54,12 @@ namespace minecraft::hooks {
         const std::uintptr_t actorSetRotAddr = hook_memory::resolve_signature(BedrockSignatures::actor_setRotation);
         const std::uintptr_t perspectiveAddr = hook_memory::resolve_signature(BedrockSignatures::options_getPerspective);
         const std::uintptr_t levelRenderCallAddr = hook_memory::resolve_signature(BedrockSignatures::render_levelRender);
+        hook_memory::resolve_signature(BedrockSignatures::render_uiFillColor);
+        hook_memory::resolve_signature(BedrockSignatures::render_tessBegin);
+        hook_memory::resolve_signature(BedrockSignatures::render_tessColor);
+        hook_memory::resolve_signature(BedrockSignatures::render_tessVertex);
+        hook_memory::resolve_signature(BedrockSignatures::render_meshImmediate);
 
-        if (!updateAddr || !s_getLocalPlayerAddr || !actorTickAddr || !levelRenderCallAddr) {
-            LOG_FATAL("One or more required signatures failed to resolve!");
-            return false;
-        }
 
         set_actor_tick_address(actorTickAddr);
 
