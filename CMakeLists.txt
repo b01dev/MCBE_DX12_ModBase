@@ -63,6 +63,7 @@ target_link_directories(MCBE_DX12_ModBase PRIVATE
 target_link_libraries(MCBE_DX12_ModBase PRIVATE
     imgui
     Minhook
+    d3d11
     d3d12
     dxgi
     Psapi

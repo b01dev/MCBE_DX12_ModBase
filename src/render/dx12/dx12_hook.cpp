@@ -4,32 +4,50 @@
 #include "ui/clickgui.h"
 #include "ui/ui_settings.h"
 #include "utils/logger.h"
+#include "input/input_manager.h"
 
 #include <Windows.h>
 #include <atomic>
+#include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <wrl/client.h>
 #include <imgui.h>
+#include <imgui_impl_dx11.h>
 #include <imgui_impl_dx12.h>
 #include <imgui_impl_win32.h>
-#include <kiero.h>
+#include <MinHook.h>
 #include <mutex>
 #include <vector>
-#include <input/input_manager.h>
+#include <filesystem>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace {
+    enum class RenderBackend {
+        None,
+        D3D12,
+        D3D11
+    };
+
     constexpr UINT kFramesInFlight = 3;
 
     using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain3*, UINT, UINT);
-    using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+    using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+    using ResizeBuffers1Fn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
     using ExecuteCommandListsFn = void(__stdcall*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
     PresentFn g_originalPresent = nullptr;
     ResizeBuffersFn g_originalResizeBuffers = nullptr;
+    ResizeBuffers1Fn g_originalResizeBuffers1 = nullptr;
     ExecuteCommandListsFn g_originalExecuteCommandLists = nullptr;
 
+    void* g_presentTarget = nullptr;
+    void* g_resizeBuffersTarget = nullptr;
+    void* g_resizeBuffers1Target = nullptr;
+    void* g_executeCommandListsTarget = nullptr;
+
+    RenderBackend g_backend = RenderBackend::None;
     HWND g_window = nullptr;
     WNDPROC g_originalWndProc = nullptr;
 
@@ -54,45 +72,17 @@ namespace {
     DXGI_FORMAT g_renderTargetFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT64 g_nextFenceValue = 1;
 
-    std::mutex g_mutex;
+    ID3D11Device* g_d3d11Device = nullptr;
+    ID3D11DeviceContext* g_d3d11Context = nullptr;
+    ID3D11RenderTargetView* g_d3d11Rtv = nullptr;
+
+    std::recursive_mutex g_mutex;
     std::atomic_bool g_initialized = false;
     std::atomic_bool g_shuttingDown = false;
     std::atomic_bool g_menuOpen = false;
-    std::atomic_int g_skipFrames = 0;
-    std::atomic<unsigned long long> g_resumeRenderAtTick = 0;
 
-    void request_render_pause(unsigned int frames, unsigned int milliseconds);
-
-    int mouse_message_key(UINT msg, WPARAM wparam, bool& down) {
-        switch (msg) {
-        case WM_LBUTTONDOWN:
-            down = true;
-            return VK_LBUTTON;
-        case WM_LBUTTONUP:
-            down = false;
-            return VK_LBUTTON;
-        case WM_RBUTTONDOWN:
-            down = true;
-            return VK_RBUTTON;
-        case WM_RBUTTONUP:
-            down = false;
-            return VK_RBUTTON;
-        case WM_MBUTTONDOWN:
-            down = true;
-            return VK_MBUTTON;
-        case WM_MBUTTONUP:
-            down = false;
-            return VK_MBUTTON;
-        case WM_XBUTTONDOWN:
-            down = true;
-            return HIWORD(wparam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
-        case WM_XBUTTONUP:
-            down = false;
-            return HIWORD(wparam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
-        default:
-            return 0;
-        }
-    }
+    std::atomic<uint32_t> g_activeResizes = 0;
+    std::atomic<int> g_resizeQuietFrames = 0;
 
     void release_gameplay_input(HWND hwnd) {
         if (!g_originalWndProc || !hwnd) return;
@@ -134,12 +124,12 @@ namespace {
     }
 
     LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+        if (g_shuttingDown.load()) {
+            return CallWindowProc(g_originalWndProc, hwnd, msg, wparam, lparam);
+        }
+
         const bool keyDown = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
         const bool keyUp = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
-
-        if ((keyDown && wparam == VK_F11) || msg == WM_SIZE || msg == WM_DISPLAYCHANGE) {
-            request_render_pause(180, 3000);
-        }
 
         if (keyUp && wparam == VK_INSERT) {
             const bool opening = !g_menuOpen.load();
@@ -197,11 +187,6 @@ namespace {
         return CallWindowProc(g_originalWndProc, hwnd, msg, wparam, lparam);
     }
 
-    void request_render_pause(unsigned int frames, unsigned int milliseconds) {
-        g_skipFrames.store(static_cast<int>(frames));
-        g_resumeRenderAtTick.store(GetTickCount64() + milliseconds);
-    }
-
     void wait_for_fence(UINT64 fenceValue) {
         if (!g_fence || !g_fenceEvent || fenceValue == 0) {
             return;
@@ -217,9 +202,13 @@ namespace {
     }
 
     void wait_for_overlay_work() {
-        for (FrameContext& frame : g_frames) {
-            wait_for_fence(frame.fenceValue);
-            frame.fenceValue = 0;
+        if (g_backend == RenderBackend::D3D12) {
+            for (FrameContext& frame : g_frames) {
+                wait_for_fence(frame.fenceValue);
+                frame.fenceValue = 0;
+            }
+        } else if (g_backend == RenderBackend::D3D11 && g_d3d11Context) {
+            g_d3d11Context->Flush();
         }
     }
 
@@ -227,7 +216,7 @@ namespace {
         ui::apply_theme();
     }
 
-    void release_frame_resources() {
+    void release_frame_resources_dx12() {
         wait_for_overlay_work();
 
         for (FrameContext& frame : g_frames) {
@@ -235,19 +224,28 @@ namespace {
                 frame.renderTarget->Release();
                 frame.renderTarget = nullptr;
             }
-
-            if (frame.allocator) {
-                frame.allocator->Release();
-                frame.allocator = nullptr;
-            }
         }
-
-        g_frames.clear();
-        g_bufferCount = 0;
 
         if (g_rtvHeap) {
             g_rtvHeap->Release();
             g_rtvHeap = nullptr;
+        }
+
+        g_frames.clear();
+        g_bufferCount = 0;
+    }
+
+    void release_surfaces_dx11() {
+        if (g_d3d11Context) {
+            ID3D11RenderTargetView* nullView = nullptr;
+            g_d3d11Context->OMSetRenderTargets(1, &nullView, nullptr);
+            g_d3d11Context->ClearState();
+            g_d3d11Context->Flush();
+        }
+
+        if (g_d3d11Rtv) {
+            g_d3d11Rtv->Release();
+            g_d3d11Rtv = nullptr;
         }
     }
 
@@ -256,11 +254,16 @@ namespace {
             return;
         }
 
-        LOG_INFO("Cleaning up ImGui & DX12 render resources...");
+        LOG_INFO("Cleaning up ImGui & render resources...");
 
         wait_for_overlay_work();
 
-        ImGui_ImplDX12_Shutdown();
+        if (g_backend == RenderBackend::D3D12) {
+            ImGui_ImplDX12_Shutdown();
+        } else if (g_backend == RenderBackend::D3D11) {
+            ImGui_ImplDX11_Shutdown();
+        }
+
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
 
@@ -269,39 +272,62 @@ namespace {
             g_originalWndProc = nullptr;
         }
 
-        release_frame_resources();
+        if (g_backend == RenderBackend::D3D12) {
+            release_frame_resources_dx12();
 
-        if (g_commandList) {
-            g_commandList->Release();
-            g_commandList = nullptr;
-        }
+            for (FrameContext& frame : g_frames) {
+                if (frame.allocator) {
+                    frame.allocator->Release();
+                    frame.allocator = nullptr;
+                }
+            }
 
-        if (g_srvHeap) {
-            g_srvHeap->Release();
-            g_srvHeap = nullptr;
-        }
+            if (g_commandList) {
+                g_commandList->Release();
+                g_commandList = nullptr;
+            }
 
-        if (g_fence) {
-            g_fence->Release();
-            g_fence = nullptr;
-        }
+            if (g_srvHeap) {
+                g_srvHeap->Release();
+                g_srvHeap = nullptr;
+            }
 
-        if (g_fenceEvent) {
-            CloseHandle(g_fenceEvent);
-            g_fenceEvent = nullptr;
-        }
+            if (g_fence) {
+                g_fence->Release();
+                g_fence = nullptr;
+            }
 
-        if (g_device) {
-            g_device->Release();
-            g_device = nullptr;
+            if (g_fenceEvent) {
+                CloseHandle(g_fenceEvent);
+                g_fenceEvent = nullptr;
+            }
+
+            if (g_device) {
+                g_device->Release();
+                g_device = nullptr;
+            }
+
+            g_commandQueue = nullptr;
+        } else if (g_backend == RenderBackend::D3D11) {
+            release_surfaces_dx11();
+
+            if (g_d3d11Context) {
+                g_d3d11Context->Release();
+                g_d3d11Context = nullptr;
+            }
+
+            if (g_d3d11Device) {
+                g_d3d11Device->Release();
+                g_d3d11Device = nullptr;
+            }
         }
 
         g_window = nullptr;
-        g_commandQueue = nullptr;
-        LOG_INFO("ImGui & DX12 render resources cleaned up successfully.");
+        g_backend = RenderBackend::None;
+        LOG_INFO("ImGui render resources cleaned up successfully.");
     }
 
-    bool create_render_targets(IDXGISwapChain3* swapChain) {
+    bool create_render_targets_dx12(IDXGISwapChain3* swapChain) {
         DXGI_SWAP_CHAIN_DESC desc{};
         if (FAILED(swapChain->GetDesc(&desc))) {
             return false;
@@ -325,8 +351,10 @@ namespace {
         for (UINT i = 0; i < g_bufferCount; ++i) {
             FrameContext& frame = g_frames[i];
 
-            if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)))) {
-                return false;
+            if (!frame.allocator) {
+                if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)))) {
+                    return false;
+                }
             }
 
             if (FAILED(swapChain->GetBuffer(i, IID_PPV_ARGS(&frame.renderTarget)))) {
@@ -341,7 +369,7 @@ namespace {
         return true;
     }
 
-    bool initialize_imgui(IDXGISwapChain3* swapChain) {
+    bool initialize_imgui_dx12(IDXGISwapChain3* swapChain) {
         if (!g_commandQueue) {
             return false;
         }
@@ -358,9 +386,11 @@ namespace {
 
         LOG_INFO("Initializing ImGui DX12 overlay for window handle: {:p}...", static_cast<void*>(g_window));
 
-        if (FAILED(swapChain->GetDevice(IID_PPV_ARGS(&g_device)))) {
-            LOG_ERROR("Failed to acquire D3D12 device from swapchain!");
-            return false;
+        if (!g_device) {
+            if (FAILED(swapChain->GetDevice(IID_PPV_ARGS(&g_device)))) {
+                LOG_ERROR("Failed to acquire D3D12 device from swapchain!");
+                return false;
+            }
         }
 
         D3D12_DESCRIPTOR_HEAP_DESC srvDesc{};
@@ -373,7 +403,7 @@ namespace {
             return false;
         }
 
-        if (!create_render_targets(swapChain)) {
+        if (!create_render_targets_dx12(swapChain)) {
             LOG_ERROR("Failed to create render target views!");
             return false;
         }
@@ -428,7 +458,60 @@ namespace {
         return true;
     }
 
-    void render_imgui(IDXGISwapChain3* swapChain) {
+    bool initialize_imgui_dx11(IDXGISwapChain3* swapChain) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        if (FAILED(swapChain->GetDesc(&desc)) || !desc.OutputWindow) {
+            return false;
+        }
+
+        g_window = desc.OutputWindow;
+
+        LOG_INFO("Initializing ImGui D3D11 fallback overlay for window handle: {:p}...", static_cast<void*>(g_window));
+
+        if (!g_d3d11Device) {
+            if (FAILED(swapChain->GetDevice(IID_PPV_ARGS(&g_d3d11Device)))) {
+                LOG_ERROR("Failed to acquire D3D11 device from swapchain!");
+                return false;
+            }
+            g_d3d11Device->GetImmediateContext(&g_d3d11Context);
+        }
+
+        ID3D11Texture2D* backBuffer = nullptr;
+        if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))) || !backBuffer) {
+            LOG_ERROR("Failed to acquire D3D11 backbuffer!");
+            return false;
+        }
+
+        HRESULT hr = g_d3d11Device->CreateRenderTargetView(backBuffer, nullptr, &g_d3d11Rtv);
+        backBuffer->Release();
+        if (FAILED(hr)) {
+            LOG_ERROR("Failed to create D3D11 RenderTargetView!");
+            return false;
+        }
+
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        static const char* fontPath = "C:\\Windows\\Fonts\\segoeui.ttf";
+        if (std::filesystem::exists(fontPath)) {
+            io.Fonts->AddFontFromFileTTF(fontPath, 22.0f);
+        }
+
+        apply_overlay_style();
+        ui_settings::reset_ui_scale_cache();
+        ImGui_ImplWin32_Init(g_window);
+        ImGui_ImplDX11_Init(g_d3d11Device, g_d3d11Context);
+
+        g_originalWndProc = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtr(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(wnd_proc)));
+
+        g_initialized.store(true);
+        LOG_INFO("ImGui D3D11 fallback overlay initialized successfully.");
+        return true;
+    }
+
+    void render_imgui_dx12(IDXGISwapChain3* swapChain) {
         const UINT index = swapChain->GetCurrentBackBufferIndex();
         if (index >= g_frames.size()) {
             return;
@@ -480,40 +563,133 @@ namespace {
         }
     }
 
-    void __stdcall hook_execute_command_lists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
-        if (!g_commandQueue && queue) {
-            g_commandQueue = queue;
+    void render_imgui_dx11(IDXGISwapChain3* swapChain) {
+        if (!g_d3d11Rtv) {
+            ID3D11Texture2D* backBuffer = nullptr;
+            if (SUCCEEDED(swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))) && backBuffer) {
+                g_d3d11Device->CreateRenderTargetView(backBuffer, nullptr, &g_d3d11Rtv);
+                backBuffer->Release();
+            }
         }
 
-        g_originalExecuteCommandLists(queue, count, lists);
+        if (!g_d3d11Rtv) return;
+
+        g_d3d11Context->OMSetRenderTargets(1, &g_d3d11Rtv, nullptr);
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ui_settings::apply_ui_scale();
+        ImGui::NewFrame();
+
+        ModuleManager::instance().on_imgui_render();
+
+        if (g_menuOpen.load()) {
+            clickgui::render();
+        }
+
+        ImGui::Render();
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
+
+    void __stdcall hook_execute_command_lists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+        if (g_activeResizes.load(std::memory_order_acquire) > 0) {
+            if (g_originalExecuteCommandLists) {
+                g_originalExecuteCommandLists(queue, count, lists);
+            }
+            return;
+        }
+
+        if (!g_commandQueue && queue) {
+            D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+            if (desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                g_commandQueue = queue;
+            }
+        }
+
+        if (g_originalExecuteCommandLists) {
+            g_originalExecuteCommandLists(queue, count, lists);
+        }
     }
 
     HRESULT __stdcall hook_present(IDXGISwapChain3* swapChain, UINT syncInterval, UINT flags) {
+        if (!swapChain || !g_originalPresent) return S_OK;
+
+        if (flags & DXGI_PRESENT_TEST) {
+            return g_originalPresent(swapChain, syncInterval, flags);
+        }
+
         if (!g_shuttingDown.load()) {
-            std::lock_guard lock(g_mutex);
-
-            const int skipFrames = g_skipFrames.load();
-            const unsigned long long now = GetTickCount64();
-            const bool inCooldown = now < g_resumeRenderAtTick.load();
-
-            if (skipFrames > 0 || inCooldown) {
-                if (skipFrames > 0) {
-                    g_skipFrames.store(skipFrames - 1);
-                }
-
-                if (g_initialized.load()) {
-                    cleanup_imgui();
-                }
-
+            if (g_activeResizes.load(std::memory_order_acquire) > 0) {
                 return g_originalPresent(swapChain, syncInterval, flags);
             }
 
+            const int quiet = g_resizeQuietFrames.load(std::memory_order_acquire);
+            if (quiet > 0) {
+                g_resizeQuietFrames.store(quiet - 1, std::memory_order_release);
+                return g_originalPresent(swapChain, syncInterval, flags);
+            }
+
+            if (g_window) {
+                if (IsIconic(g_window)) {
+                    return g_originalPresent(swapChain, syncInterval, flags);
+                }
+                RECT cr{};
+                GetClientRect(g_window, &cr);
+                if ((cr.right - cr.left) < 16 || (cr.bottom - cr.top) < 16) {
+                    return g_originalPresent(swapChain, syncInterval, flags);
+                }
+            }
+
+            std::lock_guard lock(g_mutex);
+
+            if (g_backend == RenderBackend::None) {
+                ID3D12Device* d12 = nullptr;
+                if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&d12))) && d12) {
+                    g_device = d12;
+                    g_backend = RenderBackend::D3D12;
+                    LOG_INFO("Detected DirectX 12 render backend.");
+                } else {
+                    ID3D11Device* d11 = nullptr;
+                    if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&d11))) && d11) {
+                        g_d3d11Device = d11;
+                        g_d3d11Device->GetImmediateContext(&g_d3d11Context);
+                        g_backend = RenderBackend::D3D11;
+                        LOG_INFO("Detected DirectX 11 fallback render backend.");
+                    }
+                }
+            }
+
             if (!g_initialized.load()) {
-                initialize_imgui(swapChain);
+                if (g_backend == RenderBackend::D3D12) {
+                    if (!g_commandQueue) {
+                        ID3D12CommandQueue* scQueue = nullptr;
+                        if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&scQueue))) && scQueue) {
+                            if (scQueue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                                g_commandQueue = scQueue;
+                            } else {
+                                scQueue->Release();
+                            }
+                        }
+                    }
+                    if (g_commandQueue) {
+                        initialize_imgui_dx12(swapChain);
+                    }
+                } else if (g_backend == RenderBackend::D3D11) {
+                    initialize_imgui_dx11(swapChain);
+                }
             }
 
             if (g_initialized.load()) {
-                render_imgui(swapChain);
+                if (g_backend == RenderBackend::D3D12) {
+                    if (g_frames.empty() || !g_rtvHeap) {
+                        create_render_targets_dx12(swapChain);
+                    }
+                    if (!g_frames.empty()) {
+                        render_imgui_dx12(swapChain);
+                    }
+                } else if (g_backend == RenderBackend::D3D11) {
+                    render_imgui_dx11(swapChain);
+                }
             }
         }
 
@@ -521,19 +697,81 @@ namespace {
     }
 
     HRESULT __stdcall hook_resize_buffers(
-        IDXGISwapChain3* swapChain,
+        IDXGISwapChain* swapChain,
         UINT bufferCount,
         UINT width,
         UINT height,
         DXGI_FORMAT newFormat,
-        UINT swapChainFlags) {
-        std::lock_guard lock(g_mutex);
+        UINT swapChainFlags)
+    {
+        if (!swapChain || !g_originalResizeBuffers) return E_INVALIDARG;
 
-        if (g_initialized.load()) {
-            cleanup_imgui();
+        g_activeResizes.fetch_add(1, std::memory_order_acq_rel);
+        HRESULT hr = S_OK;
+        {
+            std::lock_guard lock(g_mutex);
+
+            if (g_initialized.load()) {
+                if (g_backend == RenderBackend::D3D12) {
+                    wait_for_overlay_work();
+                    release_frame_resources_dx12();
+                    wait_for_overlay_work();
+                } else if (g_backend == RenderBackend::D3D11) {
+                    release_surfaces_dx11();
+                }
+            }
+
+            hr = g_originalResizeBuffers(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
         }
 
-        return g_originalResizeBuffers(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
+        g_resizeQuietFrames.store(4, std::memory_order_release);
+        g_activeResizes.fetch_sub(1, std::memory_order_acq_rel);
+        return hr;
+    }
+
+    HRESULT __stdcall hook_resize_buffers1(
+        IDXGISwapChain* swapChain,
+        UINT bufferCount,
+        UINT width,
+        UINT height,
+        DXGI_FORMAT newFormat,
+        UINT swapChainFlags,
+        const UINT* pCreationNodeMask,
+        IUnknown* const* ppPresentQueue)
+    {
+        if (!swapChain || !g_originalResizeBuffers1) return E_INVALIDARG;
+
+        if (ppPresentQueue && *ppPresentQueue) {
+            ID3D12CommandQueue* queue = nullptr;
+            if (SUCCEEDED((*ppPresentQueue)->QueryInterface(IID_PPV_ARGS(&queue))) && queue) {
+                if (queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+                    g_commandQueue = queue;
+                }
+                queue->Release();
+            }
+        }
+
+        g_activeResizes.fetch_add(1, std::memory_order_acq_rel);
+        HRESULT hr = S_OK;
+        {
+            std::lock_guard lock(g_mutex);
+
+            if (g_initialized.load()) {
+                if (g_backend == RenderBackend::D3D12) {
+                    wait_for_overlay_work();
+                    release_frame_resources_dx12();
+                    wait_for_overlay_work();
+                } else if (g_backend == RenderBackend::D3D11) {
+                    release_surfaces_dx11();
+                }
+            }
+
+            hr = g_originalResizeBuffers1(swapChain, bufferCount, width, height, newFormat, swapChainFlags, pCreationNodeMask, ppPresentQueue);
+        }
+
+        g_resizeQuietFrames.store(4, std::memory_order_release);
+        g_activeResizes.fetch_sub(1, std::memory_order_acq_rel);
+        return hr;
     }
 }
 
@@ -541,38 +779,116 @@ namespace dx12_hook {
     bool start(HMODULE) {
         g_shuttingDown.store(false);
 
-        LOG_INFO("Initializing Kiero D3D12 hook...");
+        LOG_INFO("Creating dummy DXGI swapchain to obtain vtable...");
 
-        if (kiero::init(kiero::RenderType::D3D12) != kiero::Status::Success) {
-            LOG_ERROR("Failed to initialize Kiero D3D12!");
+        Microsoft::WRL::ComPtr<IDXGIFactory> factory;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        Microsoft::WRL::ComPtr<IDXGISwapChain> swapChain;
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> dctx;
+
+        if (FAILED(CreateDXGIFactory(IID_PPV_ARGS(&factory))) || !factory) {
+            LOG_ERROR("Failed to create DXGI factory!");
+            return false;
+        }
+        if (FAILED(factory->EnumAdapters(0, adapter.GetAddressOf())) || !adapter) {
+            LOG_ERROR("Failed to enumerate DXGI adapter!");
             return false;
         }
 
-        constexpr uint16_t executeCommandListsIndex = 54;
-        constexpr uint16_t presentIndex = 140;
-        constexpr uint16_t resizeBuffersIndex = 145;
+        WNDCLASSEXW wnd = { sizeof(WNDCLASSEXW) };
+        wnd.hInstance = GetModuleHandle(nullptr);
+        wnd.lpszClassName = L"modbase_dummy";
+        wnd.lpfnWndProc = DefWindowProcW;
+        RegisterClassExW(&wnd);
 
-        if (kiero::bind(executeCommandListsIndex, reinterpret_cast<void**>(&g_originalExecuteCommandLists), hook_execute_command_lists) != kiero::Status::Success) {
-            LOG_ERROR("Failed to bind ExecuteCommandLists hook!");
+        HWND hWnd = CreateWindowExW(0, L"modbase_dummy", L"", WS_MINIMIZEBOX, 0, 0, 100, 100, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+
+        DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
+        swapChainDesc.BufferCount = 2;
+        swapChainDesc.BufferDesc.Width = 100;
+        swapChainDesc.BufferDesc.Height = 100;
+        swapChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        swapChainDesc.OutputWindow = hWnd;
+        swapChainDesc.SampleDesc.Count = 1;
+        swapChainDesc.Windowed = TRUE;
+
+        D3D_FEATURE_LEVEL lvl[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
+        D3D_FEATURE_LEVEL featureLevel;
+        HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, lvl, 2, D3D11_SDK_VERSION,
+                                                    &swapChainDesc, swapChain.GetAddressOf(), device.GetAddressOf(),
+                                                    &featureLevel, dctx.GetAddressOf());
+
+        uintptr_t* vftable = swapChain ? *reinterpret_cast<uintptr_t**>(swapChain.Get()) : nullptr;
+        uintptr_t* cqueueVftable = nullptr;
+
+        HMODULE hD3D12 = GetModuleHandleA("d3d12.dll");
+        if (!hD3D12) {
+            hD3D12 = LoadLibraryA("d3d12.dll");
+        }
+        if (hD3D12) {
+            typedef HRESULT(WINAPI* PFN_D3D12_CREATE_DEVICE)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+            auto pfnD3D12CreateDevice = reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(GetProcAddress(hD3D12, "D3D12CreateDevice"));
+            if (pfnD3D12CreateDevice && adapter) {
+                Microsoft::WRL::ComPtr<ID3D12Device> device12;
+                if (SUCCEEDED(pfnD3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12))) && device12) {
+                    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+                    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+                    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+                    Microsoft::WRL::ComPtr<ID3D12CommandQueue> cqueue;
+                    if (SUCCEEDED(device12->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&cqueue))) && cqueue) {
+                        cqueueVftable = *reinterpret_cast<uintptr_t**>(cqueue.Get());
+                    }
+                }
+            }
+        }
+
+        if (hWnd) DestroyWindow(hWnd);
+        UnregisterClassW(L"modbase_dummy", GetModuleHandle(nullptr));
+
+        if (!vftable) {
+            LOG_ERROR("Failed to obtain DXGI SwapChain vtable!");
             return false;
         }
 
-        if (kiero::bind(presentIndex, reinterpret_cast<void**>(&g_originalPresent), hook_present) != kiero::Status::Success) {
-            LOG_ERROR("Failed to bind Present hook!");
+        g_presentTarget = reinterpret_cast<void*>(vftable[8]);
+        if (MH_CreateHook(g_presentTarget, reinterpret_cast<void*>(&hook_present), reinterpret_cast<void**>(&g_originalPresent)) != MH_OK ||
+            MH_EnableHook(g_presentTarget) != MH_OK) {
+            LOG_ERROR("Failed to hook Present!");
             return false;
         }
 
-        if (kiero::bind(resizeBuffersIndex, reinterpret_cast<void**>(&g_originalResizeBuffers), hook_resize_buffers) != kiero::Status::Success) {
-            LOG_ERROR("Failed to bind ResizeBuffers hook!");
+        g_resizeBuffersTarget = reinterpret_cast<void*>(vftable[13]);
+        if (MH_CreateHook(g_resizeBuffersTarget, reinterpret_cast<void*>(&hook_resize_buffers), reinterpret_cast<void**>(&g_originalResizeBuffers)) != MH_OK ||
+            MH_EnableHook(g_resizeBuffersTarget) != MH_OK) {
+            LOG_ERROR("Failed to hook ResizeBuffers!");
             return false;
         }
 
-        LOG_INFO("DX12 hooks bound successfully.");
+        if (vftable[39]) {
+            g_resizeBuffers1Target = reinterpret_cast<void*>(vftable[39]);
+            if (MH_CreateHook(g_resizeBuffers1Target, reinterpret_cast<void*>(&hook_resize_buffers1), reinterpret_cast<void**>(&g_originalResizeBuffers1)) == MH_OK) {
+                MH_EnableHook(g_resizeBuffers1Target);
+                LOG_INFO("Hooked ResizeBuffers1 successfully (slot 39).");
+            }
+        }
+
+        if (cqueueVftable && cqueueVftable[10]) {
+            g_executeCommandListsTarget = reinterpret_cast<void*>(cqueueVftable[10]);
+            if (MH_CreateHook(g_executeCommandListsTarget, reinterpret_cast<void*>(&hook_execute_command_lists), reinterpret_cast<void**>(&g_originalExecuteCommandLists)) == MH_OK) {
+                MH_EnableHook(g_executeCommandListsTarget);
+                LOG_INFO("Hooked D3D12 ExecuteCommandLists successfully.");
+            }
+        }
+
+        LOG_INFO("Render hooks initialized successfully (supporting DX12 & DX11 fallback).");
         return true;
     }
 
     void stop() {
-        LOG_INFO("Stopping DX12 hook...");
+        LOG_INFO("Stopping render hooks...");
         g_shuttingDown.store(true);
 
         {
@@ -580,8 +896,28 @@ namespace dx12_hook {
             cleanup_imgui();
         }
 
-        kiero::shutdown();
-        LOG_INFO("DX12 hook stopped.");
+        if (g_executeCommandListsTarget) {
+            MH_DisableHook(g_executeCommandListsTarget);
+            MH_RemoveHook(g_executeCommandListsTarget);
+            g_executeCommandListsTarget = nullptr;
+        }
+        if (g_resizeBuffers1Target) {
+            MH_DisableHook(g_resizeBuffers1Target);
+            MH_RemoveHook(g_resizeBuffers1Target);
+            g_resizeBuffers1Target = nullptr;
+        }
+        if (g_resizeBuffersTarget) {
+            MH_DisableHook(g_resizeBuffersTarget);
+            MH_RemoveHook(g_resizeBuffersTarget);
+            g_resizeBuffersTarget = nullptr;
+        }
+        if (g_presentTarget) {
+            MH_DisableHook(g_presentTarget);
+            MH_RemoveHook(g_presentTarget);
+            g_presentTarget = nullptr;
+        }
+
+        LOG_INFO("Render hooks stopped.");
     }
 
     bool is_menu_open() {

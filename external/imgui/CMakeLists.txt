@@ -5,6 +5,7 @@ set(IMGUI_SOURCES
     imgui_tables.cpp
     imgui_widgets.cpp
     imgui_impl_win32.cpp
+    imgui_impl_dx11.cpp
     imgui_impl_dx12.cpp
 )
 
@@ -13,6 +14,7 @@ set(IMGUI_HEADERS
     imgui.h
     imgui_internal.h
     imgui_impl_win32.h
+    imgui_impl_dx11.h
     imgui_impl_dx12.h
 )
 
